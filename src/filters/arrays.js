@@ -1,10 +1,19 @@
+/* jshint ignore:start */
 var DiffContext = require('../contexts/diff').DiffContext;
 var PatchContext = require('../contexts/patch').PatchContext;
 var ReverseContext = require('../contexts/reverse').ReverseContext;
 
 var lcs = require('./lcs');
 
+var ARRAY_REMOVE = 0;
 var ARRAY_MOVE = 3;
+
+var REMOVE_PREFIX = '-';
+var INSERT_PREFIX = '+';
+var MODIFY_PREFIX = '!';
+
+var INDEX_PREFIX = '@';
+var HASH_PREFIX = '#';
 
 var isArray = (typeof Array.isArray === 'function') ?
   // use native function
@@ -82,6 +91,17 @@ function matchItems(array1, array2, index1, index2, context) {
   return hash1 === hash2;
 }
 
+function hashOrIndex(object, index, matchContext) {
+  var hash;
+  if (matchContext.objectHash) {
+    hash = matchContext.objectHash(object);
+  }
+  if (hash !== undefined) {
+    return HASH_PREFIX + hash;
+  }
+  return INDEX_PREFIX + index;
+}
+
 var diffFilter = function arraysDiffFilter(context) {
   if (!context.leftIsArray) {
     return;
@@ -102,6 +122,7 @@ var diffFilter = function arraysDiffFilter(context) {
   var len2 = array2.length;
 
   var child;
+  var hashKey;
 
   if (len1 > 0 && len2 > 0 && !matchContext.objectHash &&
     typeof matchContext.matchByPosition !== 'boolean') {
@@ -113,7 +134,8 @@ var diffFilter = function arraysDiffFilter(context) {
     matchItems(array1, array2, commonHead, commonHead, matchContext)) {
     index = commonHead;
     child = new DiffContext(context.left[index], context.right[index]);
-    context.push(child, index);
+    hashKey = hashOrIndex(array1[index], index, matchContext);
+    context.push(child, MODIFY_PREFIX + hashKey);
     commonHead++;
   }
   // separate common tail
@@ -122,7 +144,8 @@ var diffFilter = function arraysDiffFilter(context) {
     index1 = len1 - 1 - commonTail;
     index2 = len2 - 1 - commonTail;
     child = new DiffContext(context.left[index1], context.right[index2]);
-    context.push(child, index2);
+    hashKey = hashOrIndex(array2[index2], index2, matchContext);
+    context.push(child, MODIFY_PREFIX + hashKey);
     commonTail++;
   }
   var result;
@@ -137,7 +160,7 @@ var diffFilter = function arraysDiffFilter(context) {
       _t: 'a'
     };
     for (index = commonHead; index < len2 - commonTail; index++) {
-      result[index] = [array2[index]];
+      result[INSERT_PREFIX + INDEX_PREFIX + index] = [array2[index]];
     }
     context.setResult(result).exit();
     return;
@@ -148,7 +171,8 @@ var diffFilter = function arraysDiffFilter(context) {
       _t: 'a'
     };
     for (index = commonHead; index < len1 - commonTail; index++) {
-      result['_' + index] = [array1[index], 0, 0];
+      hashKey = hashOrIndex(array1[index], index, matchContext);
+      result[REMOVE_PREFIX + hashKey] = [array1[index], index, 0, ARRAY_REMOVE];
     }
     context.setResult(result).exit();
     return;
@@ -172,7 +196,8 @@ var diffFilter = function arraysDiffFilter(context) {
   for (index = commonHead; index < len1 - commonTail; index++) {
     if (arrayIndexOf(seq.indices1, index - commonHead) < 0) {
       // removed
-      result['_' + index] = [array1[index], 0, 0];
+      hashKey = hashOrIndex(array1[index], index, matchContext);
+      result[REMOVE_PREFIX + hashKey] = [array1[index], index, 0, ARRAY_REMOVE];
       removedItems.push(index);
     }
   }
@@ -197,16 +222,17 @@ var diffFilter = function arraysDiffFilter(context) {
           index1 = removedItems[removeItemIndex1];
           if (matchItems(trimmed1, trimmed2, index1 - commonHead,
             index - commonHead, matchContext)) {
-            // store position move as: [originalValue, newPosition, ARRAY_MOVE]
-            result['_' + index1].splice(1, 2, index, ARRAY_MOVE);
+            hashKey = hashOrIndex(array1[index1], index1, matchContext);
+            // store position move as: [originalValue, originalPosition, newPosition, ARRAY_MOVE]
+            result[REMOVE_PREFIX + hashKey].splice(1, 3, index1, index, ARRAY_MOVE);
             if (!includeValueOnMove) {
               // don't include moved value on diff, to save bytes
-              result['_' + index1][0] = '';
+              result[REMOVE_PREFIX + hashKey][0] = '';
             }
 
             index2 = index;
             child = new DiffContext(context.left[index1], context.right[index2]);
-            context.push(child, index2);
+            context.push(child, MODIFY_PREFIX + hashKey);
             removedItems.splice(removeItemIndex1, 1);
             isMove = true;
             break;
@@ -215,14 +241,15 @@ var diffFilter = function arraysDiffFilter(context) {
       }
       if (!isMove) {
         // added
-        result[index] = [array2[index]];
+        result[INSERT_PREFIX + INDEX_PREFIX + index] = [array2[index]];
       }
     } else {
       // match, do inner diff
       index1 = seq.indices1[indexOnArray2] + commonHead;
       index2 = seq.indices2[indexOnArray2] + commonHead;
       child = new DiffContext(context.left[index1], context.right[index2]);
-      context.push(child, index2);
+      hashKey = hashOrIndex(array2[index2], index2, matchContext);
+      context.push(child, MODIFY_PREFIX + hashKey);
     }
   }
 
@@ -249,56 +276,68 @@ var patchFilter = function nestedPatchFilter(context) {
   if (context.delta._t !== 'a') {
     return;
   }
-  var index, index1;
+  var index;
 
   var delta = context.delta;
   var array = context.left;
 
+  var matchContext = {
+    objectHash: context.options && context.options.objectHash,
+  };
+
   // first, separate removals, insertions and modifications
-  var toRemove = [];
+  var toRemove = {};
   var toInsert = [];
-  var toModify = [];
+  var toModify = {};
   for (index in delta) {
     if (index !== '_t') {
-      if (index[0] === '_') {
+      if (index[0] === REMOVE_PREFIX) {
         // removed item from original array
-        if (delta[index][2] === 0 || delta[index][2] === ARRAY_MOVE) {
-          toRemove.push(parseInt(index.slice(1), 10));
+        if (delta[index][3] === ARRAY_REMOVE || delta[index][3] === ARRAY_MOVE) {
+          toRemove[index.slice(1)] = true;
         } else {
           throw new Error('only removal or move can be applied at original array indices' +
-            ', invalid diff type: ' + delta[index][2]);
+            ', invalid diff type: ' + delta[index][3]);
         }
       } else {
-        if (delta[index].length === 1) {
+        if (index[0] === INSERT_PREFIX) {
           // added item at new array
           toInsert.push({
-            index: parseInt(index, 10),
+            index: parseInt(index.slice(2), 10),
             value: delta[index][0]
           });
-        } else {
+        } else if (index[0] === MODIFY_PREFIX){
           // modified item at new array
-          toModify.push({
-            index: parseInt(index, 10),
-            delta: delta[index]
-          });
+          toModify[index.slice(1)] = delta[index];
         }
       }
     }
   }
 
-  // remove items, in reverse order to avoid sawing our own floor
-  toRemove = toRemove.sort(compare.numerically);
-  for (index = toRemove.length - 1; index >= 0; index--) {
-    index1 = toRemove[index];
-    var indexDiff = delta['_' + index1];
-    var removedValue = array.splice(index1, 1)[0];
-    if (indexDiff[2] === ARRAY_MOVE) {
-      // reinsert later
-      toInsert.push({
-        index: indexDiff[1],
-        value: removedValue
-      });
+  // remove items, by key
+  var hashKey;
+  var indexDiff;
+  var toRemoveIndexes = [];
+  for (index = 0; index < array.length; index++) {
+    hashKey = hashOrIndex(array[index], index, matchContext);
+    if (toRemove[hashKey]) {
+      toRemoveIndexes.push(index);
+      indexDiff = delta[REMOVE_PREFIX + hashKey];
+      if (indexDiff[3] === ARRAY_MOVE) {
+        // reinsert later
+        toInsert.push({
+          index: indexDiff[2],
+          value: array[index]
+        });
+      }
+      continue;
     }
+  }
+
+  // remove items, in reverse order to avoid sawing our own floor
+  toRemoveIndexes = toRemoveIndexes.sort(compare.numerically);
+  for (index = toRemoveIndexes.length - 1; index >= 0; index--) {
+    array.splice(toRemoveIndexes[index], 1);
   }
 
   // insert items, in reverse order to avoid moving our own floor
@@ -310,13 +349,13 @@ var patchFilter = function nestedPatchFilter(context) {
   }
 
   // apply modifications
-  var toModifyLength = toModify.length;
-  var child;
-  if (toModifyLength > 0) {
-    for (index = 0; index < toModifyLength; index++) {
-      var modification = toModify[index];
-      child = new PatchContext(context.left[modification.index], modification.delta);
-      context.push(child, modification.index);
+  var keysToModify = Object.keys(toModify);
+  var toModifyLength = keysToModify.length;
+  for (var j = 0; toModifyLength && j < array.length; j++) {
+    hashKey = hashOrIndex(array[j], j, matchContext);
+    if (toModify[hashKey]) {
+      var child = new PatchContext(context.left[j], toModify[hashKey]);
+      context.push(child, j);
     }
   }
 
@@ -346,14 +385,7 @@ var collectChildrenPatchFilter = function collectChildrenPatchFilter(context) {
 collectChildrenPatchFilter.filterName = 'arraysCollectChildren';
 
 var reverseFilter = function arraysReverseFilter(context) {
-  if (!context.nested) {
-    if (context.delta[2] === ARRAY_MOVE) {
-      context.newName = '_' + context.delta[1];
-      context.setResult([context.delta[0], parseInt(context.childName.substr(1), 10), ARRAY_MOVE]).exit();
-    }
-    return;
-  }
-  if (context.delta._t !== 'a') {
+  if (!context.nested || context.delta._t !== 'a') {
     return;
   }
   var name, child;
@@ -369,19 +401,20 @@ var reverseFilter = function arraysReverseFilter(context) {
 reverseFilter.filterName = 'arrays';
 
 var reverseArrayDeltaIndex = function(delta, index, itemDelta) {
-  if (typeof index === 'string' && index[0] === '_') {
-    return parseInt(index.substr(1), 10);
-  } else if (isArray(itemDelta) && itemDelta[2] === 0) {
-    return '_' + index;
+  // We neednt worry about hash indexes here
+  if (index[1] === HASH_PREFIX) {
+    return index;
   }
 
-  var reverseIndex = +index;
+  // Return a new index based on sequences of moves, inserts, and removes
+  var reverseIndex = +index.slice(2);
   for (var deltaIndex in delta) {
     var deltaItem = delta[deltaIndex];
     if (isArray(deltaItem)) {
-      if (deltaItem[2] === ARRAY_MOVE) {
-        var moveFromIndex = parseInt(deltaIndex.substr(1), 10);
-        var moveToIndex = deltaItem[1];
+      // Handle moves
+      if (deltaItem[3] === ARRAY_MOVE) {
+        var moveFromIndex = deltaItem[1];
+        var moveToIndex = deltaItem[2];
         if (moveToIndex === +index) {
           return moveFromIndex;
         }
@@ -390,44 +423,131 @@ var reverseArrayDeltaIndex = function(delta, index, itemDelta) {
         } else if (moveFromIndex >= reverseIndex && moveToIndex < reverseIndex) {
           reverseIndex--;
         }
-      } else if (deltaItem[2] === 0) {
-        var deleteIndex = parseInt(deltaIndex.substr(1), 10);
+      // Handle removals
+      } else if (deltaItem[3] === ARRAY_REMOVE) {
+        var deleteIndex = deltaItem[1];
         if (deleteIndex <= reverseIndex) {
           reverseIndex++;
         }
+      // Handle inserts
       } else if (deltaItem.length === 1 && deltaIndex <= reverseIndex) {
         reverseIndex--;
       }
     }
   }
 
-  return reverseIndex;
+  return index[0] + INDEX_PREFIX + reverseIndex;
 };
 
+/**
+ * Reverse for arrays is a little bit tricky. We have two main filters–
+ * collectChildrenReverseFilter and reverseFilter–where collect is one of the
+ * first filters to run in the pipe, and reverse is one of the last filters to
+ * run.
+ *
+ * In the default jsondiffpatch arrays implementation, the key of the array
+ * delta object for a removal/move represents the old index of the item. However,
+ * in this implementation we want to use the key to track the objectHash of the
+ * item, so we need to figure out another place to store old index information.
+ *
+ * To do so we change the remove/move array structure to support four elements
+ * instead of three:
+ * [ value, oldIndex, newIndex, remove/move flag ]  (we added oldIndex)
+ *
+ * However, this caused an issue where array removals were first being processed
+ * by trivialReverseFilter – which still uses the three-item array syntax. To
+ * work around this, we move processing of array child elements into the collect
+ * filter since it is one of the first filters to run and we can intercept a
+ * change before its handled by trivialFilter
+ *
+ * So in practice, here is how an array is processed in these filters
+ *
+ * 1. collectChildrenReverseFilter
+ *   Receives array but children haven't been processed yet, so it's ignored
+ * 2. reverseFilter
+ *   Receives array, iterates over child keys and pushes them onto context children
+ * 3. collectChildrenReverseFilter
+ *   Executed for each child, we reverse each child delta
+ *   (except for modify, which can still be handled by trivialReverseFilter)
+ * 4. collectChildrenReverseFilter
+ *   Receives array again, fix array keys if necessary and mark array as complete
+ */
 var collectChildrenReverseFilter = function collectChildrenReverseFilter(context) {
-  if (!context || !context.children) {
+  if (!context) {
     return;
   }
-  if (context.delta._t !== 'a') {
-    return;
-  }
-  var length = context.children.length;
-  var child;
-  var delta = {
-    _t: 'a'
+  var matchContext = {
+    objectHash: context.options && context.options.objectHash,
   };
 
-  for (var index = 0; index < length; index++) {
-    child = context.children[index];
-    var name = child.newName;
-    if (typeof name === 'undefined') {
-      name = reverseArrayDeltaIndex(context.delta, child.childName, child.result);
+  // Handle array element children (see function description)
+  if (context.parent && context.parent.delta && context.parent.delta._t === 'a') {
+
+    // Change inserts to removals
+    if (context.childName[0] === INSERT_PREFIX) {
+      var oldindex = parseInt(context.childName.slice(2), 10);
+      context.newName = REMOVE_PREFIX + hashOrIndex(context.delta[0], oldindex, matchContext);
+      context.setResult([context.delta[0], oldindex, 0, ARRAY_REMOVE]).exit();
+      return;
     }
-    if (delta[name] !== child.result) {
-      delta[name] = child.result;
+
+    // Handle move/remove
+    if (context.childName[0] === REMOVE_PREFIX) {
+      // If it was originally a move, reverse the move
+      if (context.delta[3] === ARRAY_MOVE) {
+        if (context.childName[1] === HASH_PREFIX) {
+          // Continue using hash for new name
+          context.newName = context.childName;
+        } else {
+          // Use index for new name
+          context.newName = REMOVE_PREFIX + INDEX_PREFIX + context.delta[2];
+        }
+        context.setResult([
+          context.delta[0],
+          context.delta[2],
+          context.delta[1],
+          ARRAY_MOVE
+        ]).exit();
+        return;
+      }
+
+      // If it was originally a removal, change to an insert
+      if (context.delta[3] === ARRAY_REMOVE) {
+        context.newName = INSERT_PREFIX + INDEX_PREFIX + context.delta[1];
+        context.setResult([context.delta[0]]).exit();
+        return;
+      }
     }
+
+    // If it was originally a MODIFY, let the "trivialReverseFilter" handle it
+    if (context.childName[0] === MODIFY_PREFIX) {
+      return;
+    }
+
+    return;
   }
-  context.setResult(delta).exit();
+
+  // Handle processed array (see function description)
+  if (context.children && context.delta._t === 'a') {
+    var length = context.children.length;
+    var child;
+    var delta = {
+      _t: 'a'
+    };
+
+    for (var index = 0; index < length; index++) {
+      child = context.children[index];
+      // Assign new name/index for child if not already assigned
+      var name = child.newName;
+      if (typeof name === 'undefined') {
+        name = reverseArrayDeltaIndex(context.delta, child.childName, child.result);
+      }
+      if (delta[name] !== child.result) {
+        delta[name] = child.result;
+      }
+    }
+    context.setResult(delta).exit();
+  }
 };
 collectChildrenReverseFilter.filterName = 'arraysCollectChildren';
 
